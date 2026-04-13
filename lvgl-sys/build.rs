@@ -79,6 +79,18 @@ fn main() {
         cc_args.push(target.clone());
     }
 
+    // Bindgen invokes clang with `-target xtensa-esp32s3-espidf` and that
+    // clang has no idea where the xtensa newlib headers live. Discover the
+    // sysroot via xtensa-esp-elf-gcc on PATH and pass `-I <sysroot>/include`
+    // so `<inttypes.h>` etc resolve. The same trick works for any
+    // `xtensa-*-espidf` target. If the toolchain isn't on PATH (host build)
+    // we silently skip -- there's nothing to add.
+    if target.starts_with("xtensa-") {
+        if let Some(sysroot_inc) = xtensa_sysroot_include() {
+            cc_args.push(format!("-I{}", sysroot_inc));
+        }
+    }
+
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bindings = bindgen::Builder::default()
         .header(shims_dir.join("lvgl_sys.h").to_str().unwrap())
@@ -115,6 +127,25 @@ fn add_c_files(build: &mut cc::Build, path: impl AsRef<Path>) {
             build.file(&p);
         }
     }
+}
+
+/// Locate the xtensa-esp-elf newlib include dir by asking
+/// `xtensa-esp-elf-gcc -print-sysroot` (then appending `/include`).
+/// Returns `None` if the tool is missing or fails.
+fn xtensa_sysroot_include() -> Option<String> {
+    use std::process::Command;
+    let out = Command::new("xtensa-esp-elf-gcc")
+        .arg("-print-sysroot")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if sysroot.is_empty() {
+        return None;
+    }
+    Some(format!("{sysroot}/include"))
 }
 
 fn canonicalize(path: impl AsRef<Path>) -> PathBuf {
