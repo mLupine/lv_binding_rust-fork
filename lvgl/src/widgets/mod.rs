@@ -1,25 +1,11 @@
-//! Widget-specific features
+//! Minimal LVGL 9 widget wrappers used by `lupin-display`.
 //!
-//! Widgets represent individual elements on the screen. Each widget has
-//! associated information, namely its parent widget and its styling data. A
-//! widget with no parent will have a screen as its parent. Style data is
-//! inherited from parent objects by default.
+//! Only `label` and `image` survive the 8→9 port. The full upstream
+//! widget set (arc, bar, slider, table, meter, keyboard) was tied to the
+//! LVGL 8 codegen pipeline and is out of scope for the Phase 4 deliverable.
 
-mod arc;
-mod bar;
-mod keyboard;
-mod label;
-mod meter;
-mod slider;
-mod table;
+pub mod image;
+pub mod label;
 
-include!(concat!(env!("OUT_DIR"), "/generated.rs"));
-
-use crate::NativeObject;
-pub use arc::*;
-pub use bar::*;
-pub use keyboard::*;
-pub use label::*;
-pub use meter::*;
-pub use slider::*;
-pub use table::*;
+pub use image::Image;
+pub use label::Label;

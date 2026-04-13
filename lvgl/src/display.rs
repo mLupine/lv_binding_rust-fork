@@ -1,415 +1,159 @@
-use crate::functions::CoreError;
-use crate::Screen;
-use crate::{disp_drv_register, disp_get_default, get_str_act, NativeObject};
-use crate::{Box, Color};
-use core::convert::TryInto;
-#[cfg(feature = "nightly")]
-use core::error::Error;
-use core::fmt;
-use core::mem::{ManuallyDrop, MaybeUninit};
-use core::pin::Pin;
+//! LVGL 9 display object wrapper (`lv_display_t`).
+//!
+//! In LVGL 8 a display was registered through a "driver-then-register"
+//! flow (fill the legacy display-driver struct, then register it). LVGL 9
+//! reverses that: [`Display::create`] allocates a display object directly
+//! via `lv_display_create(hres, vres)`, then per-attribute setters
+//! configure flush, buffers, color format, etc.
+//!
+//! Most consumers in this workspace will instead obtain a display via
+//! [`Display::from_raw`] — `esp_lvgl_port`'s `lvgl_port_add_disp` returns
+//! a `*mut lv_display_t` we wrap rather than re-creating ourselves. See
+//! Phase 4 CONTEXT.md decision D-29-a.
+
 use core::ptr::NonNull;
-use core::{ptr, result};
 
-/// Error in interacting with a `Display`.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum DisplayError {
-    NotAvailable,
-    FailedToRegister,
-    NotRegistered,
+use crate::color::ColorFormat;
+
+/// Render mode for [`Display::set_buffers`]. Mirrors LVGL 9's
+/// `lv_display_render_mode_t`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DisplayRenderMode {
+    /// `LV_DISPLAY_RENDER_MODE_PARTIAL` — buffer holds a slice of the
+    /// screen; driver flushes incrementally. This is what `esp_lvgl_port`
+    /// uses by default.
+    Partial,
+    /// `LV_DISPLAY_RENDER_MODE_DIRECT` — buffer is the full screen and
+    /// drawn into directly.
+    Direct,
+    /// `LV_DISPLAY_RENDER_MODE_FULL` — like `Direct` but always re-renders
+    /// the entire screen each frame.
+    Full,
 }
 
-impl fmt::Display for DisplayError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Display {}",
-            match self {
-                DisplayError::NotAvailable => "not available",
-                DisplayError::FailedToRegister => "failed to register",
-                DisplayError::NotRegistered => "not registered",
-            }
-        )
+impl DisplayRenderMode {
+    pub fn as_raw(self) -> lvgl_sys::lv_display_render_mode_t {
+        use lvgl_sys as s;
+        match self {
+            DisplayRenderMode::Partial => s::lv_display_render_mode_t_LV_DISPLAY_RENDER_MODE_PARTIAL,
+            DisplayRenderMode::Direct => s::lv_display_render_mode_t_LV_DISPLAY_RENDER_MODE_DIRECT,
+            DisplayRenderMode::Full => s::lv_display_render_mode_t_LV_DISPLAY_RENDER_MODE_FULL,
+        }
     }
 }
 
-#[cfg(feature = "nightly")]
-impl Error for DisplayError {}
-
-type Result<T> = result::Result<T, DisplayError>;
-
-/// An LVGL-registered display. Equivalent to an `lv_disp_t`.
+/// An LVGL 9 display handle. Wraps `*mut lv_display_t`.
+///
+/// **Ownership model:** A `Display` constructed via [`Display::create`]
+/// owns its `lv_display_t` and will call `lv_display_delete` on drop. A
+/// `Display` constructed via [`Display::from_raw`] does *not* take
+/// ownership — `esp_lvgl_port` (or whoever created the underlying object)
+/// retains responsibility for tearing it down. This matches CONTEXT.md
+/// D-29-a's "wrap pointers from `lvgl_port_add_disp`" pattern.
 pub struct Display {
-    pub(crate) disp: NonNull<lvgl_sys::lv_disp_t>,
-    drop: Option<unsafe extern "C" fn()>,
+    raw: NonNull<lvgl_sys::lv_display_t>,
+    owned: bool,
 }
 
-impl<'a> Display {
-    pub(crate) fn from_raw(
-        disp: NonNull<lvgl_sys::lv_disp_t>,
-        drop: Option<unsafe extern "C" fn()>,
-    ) -> Self {
-        Self { disp, drop }
+impl Display {
+    /// Create a new display via `lv_display_create`. Returns `None` if LVGL
+    /// is out of memory.
+    pub fn create(hor_res: i32, ver_res: i32) -> Option<Self> {
+        let raw = unsafe { lvgl_sys::lv_display_create(hor_res, ver_res) };
+        NonNull::new(raw).map(|raw| Self { raw, owned: true })
     }
 
-    /// Registers a given `DrawBuffer` with an associated update function to
-    /// LVGL. `display_update` takes a `&DisplayRefresh`.
-    pub fn register<F, const N: usize>(
-        draw_buffer: DrawBuffer<N>,
-        hor_res: u32,
-        ver_res: u32,
-        display_update: F,
-    ) -> Result<Self>
-    where
-        F: FnMut(&DisplayRefresh<N>) + 'a,
-    {
-        let mut display_diver = DisplayDriver::new(draw_buffer, display_update)?;
-        let disp_p = &mut display_diver.disp_drv;
-        disp_p.hor_res = hor_res.try_into().unwrap_or(240);
-        disp_p.ver_res = ver_res.try_into().unwrap_or(240);
-        Ok(disp_drv_register(&mut display_diver, None)?)
-        //display_diver.disp_drv.leak();
-    }
-
-    /// Returns the current active screen.
-    pub fn get_scr_act(&'a self) -> Result<Screen<'a>> {
-        Ok(get_str_act(Some(self))?.try_into()?)
-    }
-
-    /// Sets a `Screen` as currently active.
-    pub fn set_scr_act(&'a self, screen: &'a mut Screen) {
-        let scr_ptr = unsafe { screen.raw().as_mut() };
-        unsafe { lvgl_sys::lv_disp_load_scr(scr_ptr) }
-    }
-
-    /// Registers a display from raw functions and values.
+    /// Wrap a `*mut lv_display_t` returned by C code (e.g.
+    /// `lvgl_port_add_disp`). The returned `Display` does **not** take
+    /// ownership; the caller is responsible for the underlying lifetime.
+    ///
+    /// Returns `None` if `raw` is null.
     ///
     /// # Safety
-    ///
-    /// `hor_res` and `ver_res` must be nonzero, and the provided functions
-    /// must not themselves cause undefined behavior.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn register_raw<const N: usize>(
-        draw_buffer: DrawBuffer<N>,
-        hor_res: u32,
-        ver_res: u32,
-        flush_cb: Option<
-            unsafe extern "C" fn(
-                *mut lvgl_sys::lv_disp_drv_t,
-                *const lvgl_sys::lv_area_t,
-                *mut lvgl_sys::lv_color_t,
-            ),
-        >,
-        rounder_cb: Option<
-            unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t, *mut lvgl_sys::lv_area_t),
-        >,
-        set_px_cb: Option<
-            unsafe extern "C" fn(
-                *mut lvgl_sys::lv_disp_drv_t,
-                *mut u8,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_color_t,
-                lvgl_sys::lv_opa_t,
-            ),
-        >,
-        clear_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t, *mut u8, u32)>,
-        monitor_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t, u32, u32)>,
-        wait_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t)>,
-        clean_dcache_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t)>,
-        drv_update_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t)>,
-        render_start_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::lv_disp_drv_t)>,
-        drop: Option<unsafe extern "C" fn()>,
-    ) -> Result<Self> {
-        let mut display_driver = DisplayDriver::new_raw(
-            draw_buffer,
-            flush_cb,
-            rounder_cb,
-            set_px_cb,
-            clear_cb,
-            monitor_cb,
-            wait_cb,
-            clean_dcache_cb,
-            drv_update_cb,
-            render_start_cb,
-        )?;
-        let disp_p = &mut display_driver.disp_drv;
-        disp_p.hor_res = hor_res.try_into().unwrap_or(240);
-        disp_p.ver_res = ver_res.try_into().unwrap_or(240);
-        Ok(disp_drv_register(&mut display_driver, drop)?)
+    /// `raw` must be a valid `lv_display_t*` for the lifetime of this
+    /// `Display`. The caller must not concurrently free it.
+    pub unsafe fn from_raw(raw: *mut lvgl_sys::lv_display_t) -> Option<Self> {
+        NonNull::new(raw).map(|raw| Self { raw, owned: false })
     }
-}
 
-impl Default for Display {
-    fn default() -> Self {
-        disp_get_default().expect("LVGL must be INITIALIZED")
+    /// Default display (returned by `lv_display_get_default`). `None` if
+    /// no display has been registered.
+    pub fn default() -> Option<Self> {
+        let raw = unsafe { lvgl_sys::lv_display_get_default() };
+        // Default-display does NOT confer ownership.
+        NonNull::new(raw).map(|raw| Self { raw, owned: false })
+    }
+
+    /// Borrow the raw pointer. Useful for passing through FFI boundaries
+    /// to other LVGL 9 entry points not yet wrapped here.
+    pub fn as_ptr(&self) -> *mut lvgl_sys::lv_display_t {
+        self.raw.as_ptr()
+    }
+
+    /// Set the per-display color format (`lv_display_set_color_format`).
+    pub fn set_color_format(&mut self, format: ColorFormat) {
+        unsafe { lvgl_sys::lv_display_set_color_format(self.raw.as_ptr(), format.as_raw()) }
+    }
+
+    /// Get the per-display color format.
+    pub fn color_format(&self) -> lvgl_sys::lv_color_format_t {
+        unsafe { lvgl_sys::lv_display_get_color_format(self.raw.as_ptr()) }
+    }
+
+    /// Set the rendering buffers (`lv_display_set_buffers`). LVGL 9's
+    /// buffer is an *untyped* byte buffer; the per-display color format
+    /// (set via [`set_color_format`]) tells LVGL how to interpret it.
+    ///
+    /// # Safety
+    /// `buf1` (and `buf2` if non-null) must each remain valid for at least
+    /// `buf_size` bytes for the lifetime of the display.
+    pub unsafe fn set_buffers(
+        &mut self,
+        buf1: *mut u8,
+        buf2: *mut u8,
+        buf_size: u32,
+        render_mode: DisplayRenderMode,
+    ) {
+        lvgl_sys::lv_display_set_buffers(
+            self.raw.as_ptr(),
+            buf1.cast(),
+            buf2.cast(),
+            buf_size,
+            render_mode.as_raw(),
+        )
+    }
+
+    /// Set the flush callback (`lv_display_set_flush_cb`). LVGL 9's
+    /// signature is `fn(*mut lv_display_t, *const lv_area_t, *mut u8)` —
+    /// the buffer is **untyped bytes** (per the per-display color format),
+    /// not the LVGL-8 `lv_color_t*`.
+    ///
+    /// `esp_lvgl_port` provides its own panel-IO-aware default flush, so
+    /// most consumers will never call this directly. It exists for the
+    /// rare case where a consumer wants a custom flush in pure Rust.
+    pub fn set_flush_cb(&mut self, flush_cb: lvgl_sys::lv_display_flush_cb_t) {
+        unsafe { lvgl_sys::lv_display_set_flush_cb(self.raw.as_ptr(), flush_cb) }
+    }
+
+    /// Mark this display as the default (`lv_display_set_default`).
+    pub fn set_as_default(&mut self) {
+        unsafe { lvgl_sys::lv_display_set_default(self.raw.as_ptr()) }
+    }
+
+    /// Active screen of this display (`lv_display_get_screen_active`).
+    pub fn screen_active(&self) -> Option<crate::screen::Screen> {
+        let raw = unsafe { lvgl_sys::lv_display_get_screen_active(self.raw.as_ptr()) };
+        NonNull::new(raw).map(crate::screen::Screen::from_raw_unowned)
     }
 }
 
 impl Drop for Display {
     fn drop(&mut self) {
-        if let Some(drop) = self.drop {
-            unsafe { drop() }
+        if self.owned {
+            unsafe { lvgl_sys::lv_display_delete(self.raw.as_ptr()) }
         }
     }
 }
 
-/// Gets the active screen of the default display.
-pub(crate) fn get_scr_act() -> Result<Screen<'static>> {
-    Ok(get_str_act(None)?.try_into()?)
-}
-
-/// A buffer of size `N` representing `N` pixels. `N` can be smaller than the
-/// entire number of pixels on the screen, in which case the screen will be
-/// drawn to multiple times per frame.
-pub struct DrawBuffer<const N: usize> {
-    draw_buf: Pin<Box<lvgl_sys::lv_disp_draw_buf_t>>,
-    _refresh_buffer: Pin<Box<[MaybeUninit<lvgl_sys::lv_color_t>; N]>>,
-}
-
-impl<const N: usize> Default for DrawBuffer<N> {
-    fn default() -> Self {
-        let mut buf = Box::pin([MaybeUninit::uninit(); N]);
-        Self {
-            draw_buf: Box::pin(unsafe {
-                let mut inner: MaybeUninit<lvgl_sys::lv_disp_draw_buf_t> = MaybeUninit::uninit();
-                let raw_ptr = buf.as_mut_ptr() as *mut _;
-                lvgl_sys::lv_disp_draw_buf_init(
-                    inner.as_mut_ptr(),
-                    raw_ptr,
-                    ptr::null_mut(),
-                    N as u32,
-                );
-                inner.assume_init()
-            }),
-            _refresh_buffer: buf,
-        }
-    }
-}
-
-impl<const N: usize> DrawBuffer<N> {
-    fn get_ptr(&mut self) -> &mut lvgl_sys::lv_disp_draw_buf_t {
-        &mut self.draw_buf
-    }
-}
-
-#[repr(C)]
-pub(crate) struct DisplayDriver<const N: usize> {
-    pub(crate) disp_drv: Pin<Box<lvgl_sys::lv_disp_drv_t>>,
-    _buffer: DrawBuffer<N>,
-}
-
-impl<'a, const N: usize> DisplayDriver<N> {
-    pub fn new<F>(
-        mut draw_buffer: DrawBuffer<N>,
-        display_update_callback: F,
-    ) -> Result<ManuallyDrop<Self>>
-    where
-        F: FnMut(&DisplayRefresh<N>) + 'a,
-    {
-        let mut disp_drv = Box::pin(unsafe {
-            let mut inner = MaybeUninit::uninit();
-            lvgl_sys::lv_disp_drv_init(inner.as_mut_ptr());
-            inner.assume_init()
-        });
-
-        // Safety: The variable `draw_buffer` is statically allocated, no need to worry about this being dropped.
-        disp_drv.draw_buf = draw_buffer.get_ptr() as *mut _;
-
-        disp_drv.user_data = Box::<F>::into_raw(Box::new(display_update_callback)) as *mut _;
-
-        // Sets trampoline pointer to the function implementation that uses the `F` type for a
-        // refresh buffer of size N specifically.
-        disp_drv.flush_cb = Some(disp_flush_trampoline::<F, N>);
-
-        // We do not store any memory that can be accidentally deallocated by on the Rust side.
-        Ok(ManuallyDrop::new(Self {
-            disp_drv,
-            _buffer: draw_buffer,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn new_raw(
-        mut draw_buffer: DrawBuffer<N>,
-        flush_cb: Option<
-            unsafe extern "C" fn(
-                *mut lvgl_sys::_lv_disp_drv_t,
-                *const lvgl_sys::lv_area_t,
-                *mut lvgl_sys::lv_color_t,
-            ),
-        >,
-        rounder_cb: Option<
-            unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t, *mut lvgl_sys::lv_area_t),
-        >,
-        set_px_cb: Option<
-            unsafe extern "C" fn(
-                *mut lvgl_sys::_lv_disp_drv_t,
-                *mut u8,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_coord_t,
-                lvgl_sys::lv_color_t,
-                lvgl_sys::lv_opa_t,
-            ),
-        >,
-        clear_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t, *mut u8, u32)>,
-        monitor_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t, u32, u32)>,
-        wait_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t)>,
-        clean_dcache_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t)>,
-        drv_update_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t)>,
-        render_start_cb: Option<unsafe extern "C" fn(*mut lvgl_sys::_lv_disp_drv_t)>,
-    ) -> Result<ManuallyDrop<Self>> {
-        let mut disp_drv = Box::pin(unsafe {
-            let mut inner = MaybeUninit::uninit();
-            lvgl_sys::lv_disp_drv_init(inner.as_mut_ptr());
-            inner.assume_init()
-        });
-
-        disp_drv.draw_buf = draw_buffer.get_ptr() as *mut _;
-
-        //disp_drv.user_data = Box::into_raw(Box::new(display_update_callback)) as *mut _;
-
-        disp_drv.flush_cb = flush_cb;
-        disp_drv.rounder_cb = rounder_cb;
-        disp_drv.set_px_cb = set_px_cb;
-        disp_drv.clear_cb = clear_cb;
-        disp_drv.monitor_cb = monitor_cb;
-        disp_drv.wait_cb = wait_cb;
-        disp_drv.clean_dcache_cb = clean_dcache_cb;
-        disp_drv.drv_update_cb = drv_update_cb;
-        disp_drv.render_start_cb = render_start_cb;
-
-        Ok(ManuallyDrop::new(Self {
-            disp_drv,
-            _buffer: draw_buffer,
-        }))
-    }
-}
-
-/// Represents a sub-area of the display that is being updated.
-pub struct Area {
-    pub x1: i16,
-    pub x2: i16,
-    pub y1: i16,
-    pub y2: i16,
-}
-
-/// An update to the display information, contains the area that is being
-/// updated and the color of the pixels that need to be updated. The colors
-/// are represented in a contiguous array.
-pub struct DisplayRefresh<const N: usize> {
-    pub area: Area,
-    pub colors: [Color; N],
-}
-
-#[cfg(feature = "embedded_graphics")]
-mod embedded_graphics_impl {
-    use crate::{Color, DisplayRefresh};
-    use embedded_graphics::prelude::*;
-    use embedded_graphics::Pixel;
-
-    impl<const N: usize> DisplayRefresh<N> {
-        pub fn as_pixels<C>(&self) -> impl IntoIterator<Item = Pixel<C>> + '_
-        where
-            C: PixelColor + From<Color>,
-        {
-            let area = &self.area;
-            let x1 = area.x1;
-            let x2 = area.x2;
-            let y1 = area.y1;
-            let y2 = area.y2;
-
-            let ys = y1..=y2;
-            let xs = (x1..=x2).enumerate();
-            let x_len = (x2 - x1 + 1) as usize;
-
-            // We use iterators here to ensure that the Rust compiler can apply all possible
-            // optimizations at compile time.
-            ys.enumerate().flat_map(move |(iy, y)| {
-                xs.clone().map(move |(ix, x)| {
-                    let color_len = x_len * iy + ix;
-                    let raw_color = self.colors[color_len];
-                    Pixel(Point::new(x as i32, y as i32), raw_color.into())
-                })
-            })
-        }
-    }
-}
-
-unsafe extern "C" fn disp_flush_trampoline<'a, F, const N: usize>(
-    disp_drv: *mut lvgl_sys::lv_disp_drv_t,
-    area: *const lvgl_sys::lv_area_t,
-    color_p: *mut lvgl_sys::lv_color_t,
-) where
-    F: FnMut(&DisplayRefresh<N>) + 'a,
-{
-    let display_driver = *disp_drv;
-    if !display_driver.user_data.is_null() {
-        let callback = &mut *(display_driver.user_data as *mut F);
-
-        let mut colors = [Color::default(); N];
-        for (color_len, color) in colors.iter_mut().enumerate() {
-            let lv_color = *color_p.add(color_len);
-            *color = Color::from_raw(lv_color);
-        }
-
-        let update = DisplayRefresh {
-            area: Area {
-                x1: (*area).x1,
-                x2: (*area).x2,
-                y1: (*area).y1,
-                y2: (*area).y2,
-            },
-            colors,
-        };
-        callback(&update);
-    }
-    // Not doing this causes a segfault in rust >= 1.69.0
-    *disp_drv = display_driver;
-    // Indicate to LVGL that we are ready with the flushing
-    lvgl_sys::lv_disp_flush_ready(disp_drv);
-}
-
-impl From<CoreError> for DisplayError {
-    fn from(err: CoreError) -> Self {
-        use DisplayError::*;
-        match err {
-            CoreError::ResourceNotAvailable => NotAvailable,
-            CoreError::OperationFailed => NotAvailable,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tests;
-
-    #[test]
-    fn get_scr_act_return_display() {
-        tests::initialize_test(true);
-        let _screen = get_str_act(None).expect("We can get the active screen");
-    }
-
-    #[test]
-    fn get_default_display() {
-        tests::initialize_test(true);
-        let display = Display::default();
-        let _screen_direct = display
-            .get_scr_act()
-            .expect("Return screen directly from the display instance");
-        let _screen_default = get_scr_act().expect("Return screen from the default display");
-    }
-
-    #[test]
-    fn register_display_directly() -> Result<()> {
-        crate::tests::initialize_test(true);
-        let display = Display::default();
-        let _screen = display
-            .get_scr_act()
-            .expect("Return screen directly from the display instance");
-        Ok(())
-    }
-}
+// Display is not Send / Sync — LVGL 9 requires all access to happen from
+// the LVGL task or under `lvgl_port_lock`.

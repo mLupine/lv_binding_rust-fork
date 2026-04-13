@@ -92,6 +92,9 @@ fn main() {
         .allowlist_type("_lv_.*")
         .allowlist_function("lv_.*")
         .allowlist_function("_lv_.*")
+        // The custom color-channel accessors live in our shim
+        // (lvgl-sys/shims/lvgl_sys.{h,c}) and are spelled `_LV_COLOR_*`.
+        .allowlist_function("_LV_COLOR_.*")
         .allowlist_var("LV_.*")
         .blocklist_function("lv_log_add") // varargs (va_list); not safely bindable on all targets
         .generate()
