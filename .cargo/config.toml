@@ -1,0 +1,19 @@
+# Inner workspace config for the mLupine lv_binding_rust fork.
+#
+# The parent workspace (lupin-esp32-fw/.cargo/config.toml) pins
+# `[build] target = "xtensa-esp32s3-espidf"` so every cargo invocation under
+# that tree cross-compiles for the ESP32-S3. Inside this nested workspace we
+# want to keep the *option* to cross-compile (Plan 04-02 Task 3 verifies the
+# fork compiles for xtensa-esp32s3-espidf) but the default `cargo build` from
+# inside the fork builds for the host so contributors can iterate quickly.
+
+# No default [build].target -- inherits host target unless --target is given.
+
+[target.xtensa-esp32s3-espidf]
+linker    = "ldproxy"
+runner    = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[unstable]
+# Cross-compiles for xtensa need build-std (no prebuilt std for the target).
+build-std = ["std", "panic_abort"]
