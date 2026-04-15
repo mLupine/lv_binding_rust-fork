@@ -40,25 +40,38 @@ fn main() {
     println!("cargo:rerun-if-changed={}", shims_dir.to_str().unwrap());
     println!("cargo:rerun-if-changed={}", lvgl_src.to_str().unwrap());
 
-    let mut cfg = Build::new();
-    add_c_files(&mut cfg, &lvgl_src);
-    add_c_files(&mut cfg, &shims_dir);
-
-    cfg.define("LV_CONF_INCLUDE_SIMPLE", Some("1"))
-        .include(&lvgl_root)
-        .include(&lvgl_src)
-        .include(&lv_config_dir)
-        .include(&vendor)
-        .warnings(false);
-
+    // On xtensa-*-espidf targets, the real LVGL object code ships via the
+    // esp-idf managed component `lvgl__lvgl` (pulled in by
+    // `idf_component.yml` on the consumer side) and is linked into the
+    // final binary by the ESP-IDF CMake build. If we run `cc::Build` here
+    // we'd produce HOST-toolchain .o files that the xtensa linker rejects
+    // ("compiled for a big endian system and target is little endian" —
+    // any host/target ISA mismatch surfaces this way). So skip the C
+    // compile on xtensa; bindgen still runs below to emit the Rust-side
+    // FFI shapes that match the component's LVGL.
+    let target_for_gate = env::var("TARGET").expect("Cargo build scripts always have TARGET");
     let cflags_extra = env::var("LVGL_CFLAGS").unwrap_or_default();
     let cflags_extra: Vec<&str> = cflags_extra.split(',').filter(|s| !s.is_empty()).collect();
-    for e in &cflags_extra {
-        let mut it = e.split('=');
-        cfg.define(it.next().unwrap(), it.next().unwrap_or_default());
-    }
 
-    cfg.compile("lvgl");
+    if !target_for_gate.starts_with("xtensa-") {
+        let mut cfg = Build::new();
+        add_c_files(&mut cfg, &lvgl_src);
+        add_c_files(&mut cfg, &shims_dir);
+
+        cfg.define("LV_CONF_INCLUDE_SIMPLE", Some("1"))
+            .include(&lvgl_root)
+            .include(&lvgl_src)
+            .include(&lv_config_dir)
+            .include(&vendor)
+            .warnings(false);
+
+        for e in &cflags_extra {
+            let mut it = e.split('=');
+            cfg.define(it.next().unwrap(), it.next().unwrap_or_default());
+        }
+
+        cfg.compile("lvgl");
+    }
 
     let mut cc_args = vec![
         "-DLV_CONF_INCLUDE_SIMPLE=1".to_string(),
